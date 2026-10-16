@@ -1,0 +1,236 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# wtf — wracam do projektu po przerwie i nie pamiętam co tu było.
+# Jedno polecenie, zero konfiguracji:
+#
+#   wtf                # aktualne repo
+#   wtf ~/code/foo     # inne repo
+#
+# Wymaga: git w PATH, Ruby 2.7+ (używa .tally). Zero gemów.
+
+require 'open3'
+require 'time'
+
+ROOT      = File.expand_path(ARGV[0] || Dir.pwd)
+DAYS      = 7
+COMMITS   = 10
+DOC_LINES = 22
+SKIP_DIRS = %w[.git node_modules vendor dist build target .venv venv __pycache__].freeze
+
+def run(*cmd)
+  out, _err, st = Open3.capture3(*cmd, chdir: ROOT)
+  st.success? ? out : nil
+end
+
+def git(*args)
+  run('git', *args)
+end
+
+def rel(path)
+  path.start_with?(ROOT) ? path[(ROOT.length + 1)..] : path
+end
+
+def header(title)
+  puts
+  puts "\e[1;36m── #{title}\e[0m"
+end
+
+def check_git!
+  return if git('rev-parse', '--git-dir')
+  abort "nie widzę repo git w #{ROOT}"
+end
+
+# ── sekcje ───────────────────────────────────────────────────────
+
+def summary_line
+  # jedno zdanie na wejściu — czy w ogóle jest po co czytać dalej
+  branch = git('rev-parse', '--abbrev-ref', 'HEAD')&.strip
+  last   = git('log', '-1', '--format=%cr')&.strip
+  dirty  = git('status', '--porcelain')&.strip.to_s
+  tail   = dirty.empty? ? '' : " · \e[33mbrudno\e[0m"
+  puts "  branch #{branch}, ostatnia zmiana #{last}#{tail}"
+end
+
+def repo_snapshot
+  header 'repo'
+  puts "  branch:   #{git('rev-parse', '--abbrev-ref', 'HEAD')&.strip}"
+
+  last = git('log', '-1', '--format=%cr|%an|%s')&.strip
+  if last && !last.empty?
+    when_, who, subj = last.split('|', 3)
+    puts "  ostatni:  #{when_}, #{who}"
+    puts "            #{subj}"
+  end
+
+  upstream = git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')&.strip
+  return if upstream.nil? || upstream.empty?
+
+  counts = git('rev-list', '--left-right', '--count', "#{upstream}...HEAD")&.strip
+  return unless counts
+
+  behind, ahead = counts.split(/\s+/).map(&:to_i)
+  parts = []
+  parts << "↑#{ahead}" if ahead.positive?
+  parts << "↓#{behind}" if behind.positive?
+  parts = ['zsynchronizowane'] if parts.empty?
+  puts "  upstream: #{upstream} (#{parts.join(' ')})"
+end
+
+def working_tree
+  header 'zmiany w working tree'
+  out = git('status', '--porcelain=v1', '-uall')
+  if out.nil? || out.strip.empty?
+    puts '  czysto.'
+    return
+  end
+
+  out.each_line do |line|
+    flag = line[0..1]
+    path = line[3..]&.strip
+    color = case flag
+            when /\?\?/ then "\e[33m"
+            when /D/    then "\e[35m"
+            when /A/    then "\e[32m"
+            when /M/    then "\e[31m"
+            else             "\e[0m"
+            end
+    puts "  #{color}#{flag}\e[0m #{path}"
+  end
+
+  stat = git('diff', '--shortstat')&.strip
+  puts "\n  unstaged: #{stat}" if stat && !stat.empty?
+  staged = git('diff', '--cached', '--shortstat')&.strip
+  puts "  staged:   #{staged}" if staged && !staged.empty?
+end
+
+def recent_commits(n = COMMITS)
+  header "ostatnie #{n} commitów"
+  out = git('log', "-#{n}", '--pretty=format:%h  %cr  %an  %s')
+  if out.nil? || out.empty?
+    puts '  brak commitów?'
+    return
+  end
+  out.each_line { |l| puts "  #{l}" }
+end
+
+def touched_recently(days = DAYS)
+  header "pliki ruszane w ostatnich #{days} dniach"
+  out = git('log', "--since=#{days} days ago", '--name-only', '--pretty=format:')
+  if out.nil? || out.strip.empty?
+    puts '  cisza — nic się nie działo.'
+    return
+  end
+
+  counts = out.lines.map(&:strip).reject(&:empty?).tally
+  if counts.empty?
+    puts '  brak zmian w tym oknie.'
+    return
+  end
+
+  counts.sort_by { |_, c| -c }.first(15).each do |path, c|
+    puts format('  %3d× %s', c, path)
+  end
+end
+
+KEY_RE = /(roadmap|todo|next[_-]?steps?|notes?|notatki|dev[_-]?sched|dev[_-]?plan|backlog|plan|stan)/i
+
+def doc_files
+  globs = [
+    '*.md', '*.txt',
+    'docs/**/*.md', 'docs/**/*.txt',
+    'doc/**/*.md'
+  ]
+  globs.flat_map { |g| Dir.glob(File.join(ROOT, g)) }
+       .select  { |f| File.file?(f) }
+       .reject  { |f| f.include?('/.git/') }
+       .uniq
+end
+
+def print_doc(path, max_lines: DOC_LINES)
+  puts
+  puts "  \e[1;33m#{rel(path)}\e[0m"
+  content = begin
+    File.read(path, encoding: 'UTF-8')
+  rescue StandardError
+    return
+  end
+  lines = content.lines
+  take  = [lines.size, max_lines].min
+  lines.first(take).each { |l| puts "    #{l.chomp}" }
+  puts "    \e[2m…(jeszcze #{lines.size - take} linii)\e[0m" if lines.size > take
+end
+
+def key_docs
+  header 'roadmap / notatki / stan projektu'
+
+  files = doc_files
+  if files.empty?
+    puts '  brak .md/.txt — nie ma czego czytać.'
+    return
+  end
+
+  hot   = files.select { |f| File.basename(f) =~ KEY_RE }
+  other = files - hot
+
+  puts '  nie widzę roadmap/todo po nazwie. pokazuję co jest:' if hot.empty?
+  hot.first(4).each { |f| print_doc(f) }
+
+  unless other.empty?
+    puts
+    puts '  pozostałe docs:'
+    other.sort.first(15).each { |f| puts "    #{rel(f)}" }
+  end
+end
+
+def scan_todos
+  header 'TODO / FIXME w kodzie (top 15)'
+  hits  = []
+  globs = %w[
+    **/*.rb **/*.js **/*.ts **/*.py **/*.go **/*.rs
+    **/*.java **/*.kt **/*.php **/*.c **/*.cpp **/*.h **/*.sh
+  ]
+
+  globs.each do |g|
+    break if hits.size > 200
+    Dir.glob(File.join(ROOT, g)).each do |f|
+      next if SKIP_DIRS.any? { |s| f.include?("/#{s}/") }
+      begin
+        File.foreach(f).with_index(1) do |line, n|
+          if line =~ /\b(TODO|FIXME|XXX|HACK)\b/
+            hits << [rel(f), n, line.strip[0, 100]]
+            break if hits.size > 200
+          end
+        end
+      rescue StandardError
+        next
+      end
+    end
+  end
+
+  if hits.empty?
+    puts '  czysto.'
+    return
+  end
+
+  hits.first(15).each do |path, n, text|
+    puts "  #{path}:#{n}"
+    puts "    #{text}"
+  end
+  puts "  ... i #{hits.size - 15} więcej" if hits.size > 15
+end
+
+# ── main ─────────────────────────────────────────────────────────
+
+puts "\e[1m#{ROOT}\e[0m  (#{Time.now.strftime('%Y-%m-%d %H:%M')})"
+
+check_git!
+summary_line
+repo_snapshot
+working_tree
+recent_commits
+touched_recently
+key_docs
+scan_todos
+puts
+
